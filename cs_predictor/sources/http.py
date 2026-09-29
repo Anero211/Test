@@ -16,20 +16,30 @@ BROWSER_HEADERS = {
 }
 
 
+# Профили браузеров для curl_cffi. Cloudflare на HLTV пропускает их по-разному,
+# поэтому при 403 переключаемся на следующий.
+PROFILES = ["safari17_0", "edge101", "chrome", "firefox133", "safari18_0"]
+
+
 class Fetcher:
-    def __init__(self, min_interval: float = 2.5, retries: int = 4, timeout: float = 30.0):
+    def __init__(self, min_interval: float = 2.5, retries: int = 6, timeout: float = 30.0):
         self.min_interval = min_interval
         self.retries = retries
         self.timeout = timeout
         self._last: dict[str, float] = {}
-        try:  # curl_cffi подделывает TLS-отпечаток Chrome — нужно для Cloudflare на HLTV
+        self._profile = 0
+        try:  # curl_cffi подделывает TLS-отпечаток браузера — нужно для Cloudflare на HLTV
             from curl_cffi import requests as cffi_requests
-            self._session = cffi_requests.Session(impersonate="chrome")
+            self._cffi = cffi_requests
             self._kind = "curl_cffi"
+            self._new_session()
         except ImportError:
             import httpx
             self._session = httpx.Client(headers=BROWSER_HEADERS, follow_redirects=True, timeout=timeout)
             self._kind = "httpx"
+
+    def _new_session(self) -> None:
+        self._session = self._cffi.Session(impersonate=PROFILES[self._profile % len(PROFILES)])
 
     def _throttle(self, url: str) -> None:
         host = urlparse(url).netloc
@@ -44,8 +54,8 @@ class Fetcher:
         for attempt in range(self.retries):
             self._throttle(url)
             try:
-                if self._kind == "curl_cffi":
-                    r = self._session.get(url, params=params, headers=h, timeout=self.timeout)
+                if self._kind == "curl_cffi":  # заголовки ставит сам профиль браузера
+                    r = self._session.get(url, params=params, headers=headers, timeout=self.timeout)
                 else:
                     r = self._session.get(url, params=params, headers=h)
             except Exception as e:  # сетевые ошибки
@@ -56,6 +66,11 @@ class Fetcher:
                 last_err = RuntimeError(f"HTTP {r.status_code} для {url}")
                 if r.status_code in (400, 401, 404):
                     break
+                if r.status_code == 403 and self._kind == "curl_cffi":
+                    self._profile += 1
+                    self._new_session()
+                    log.info("403 — меняю профиль браузера на %s", PROFILES[self._profile % len(PROFILES)])
+                    continue
             delay = 2 ** (attempt + 1)
             log.warning("%s — повтор через %ss", last_err, delay)
             time.sleep(delay)

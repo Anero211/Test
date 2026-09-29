@@ -19,6 +19,17 @@ BASE = "https://www.hltv.org"
 _BO_RE = re.compile(r"\bbo(\d)\b", re.I)
 
 
+# Сокращения карт на странице результатов HLTV -> полные названия (как на странице матча)
+MAP_ABBR = {"d2": "dust2", "mrg": "mirage", "inf": "inferno", "nuke": "nuke", "anc": "ancient",
+            "anb": "anubis", "trn": "train", "ovp": "overpass", "vtg": "vertigo", "cch": "cache",
+            "cbl": "cobblestone", "tsc": "tuscan", "de_dust2": "dust2"}
+
+
+def canonical_map(name: str) -> str:
+    n = name.strip().lower().replace(" ", "")
+    return MAP_ABBR.get(n, n)
+
+
 def _text(el) -> str:
     return el.get_text(" ", strip=True) if el else ""
 
@@ -43,6 +54,8 @@ def parse_results_page(html: str) -> list[Match]:
         except ValueError:
             continue
         map_text = _text(con.select_one(".map-text")).lower()
+        if map_text == "def":  # техническое поражение — не игра
+            continue
         bo = _BO_RE.search(map_text)
         maps: list[MapResult] = []
         if bo:
@@ -50,8 +63,8 @@ def parse_results_page(html: str) -> list[Match]:
         else:  # Bo1: в map-text название карты, в счёте — раунды
             best_of = 1
             winner = 1 if s1 > s2 else 2
-            if map_text and map_text not in ("def", "-"):
-                maps = [MapResult(map_text, winner)]
+            if map_text and map_text != "-":
+                maps = [MapResult(canonical_map(map_text), winner)]
             s1, s2 = int(winner == 1), int(winner == 2)
         out[mid.group(1)] = Match(
             match_id=f"hltv:{mid.group(1)}", date=parse_dt(ts), team1=t1, team2=t2,
@@ -67,7 +80,7 @@ def parse_match_maps(html: str, team1: str) -> list[MapResult]:
     soup = BeautifulSoup(html, "html.parser")
     out = []
     for holder in soup.select("div.mapholder"):
-        name = _text(holder.select_one(".mapname")).lower()
+        name = canonical_map(_text(holder.select_one(".mapname")))
         left = holder.select_one(".results-left")
         right = holder.select_one(".results-right")
         if not name or name == "tba" or not left or not right:

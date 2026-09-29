@@ -229,8 +229,16 @@ def capture_with_playwright(page_url: str, wait_seconds: float = 12.0, dump_dir:
         except Exception:
             pass
 
+    import os
+    launch: dict[str, Any] = {"headless": True}
+    if os.environ.get("HTTPS_PROXY"):  # корпоративный/облачный прокси
+        launch["proxy"] = {"server": os.environ["HTTPS_PROXY"]}
+    if os.environ.get("BROWSER_EXTRA_ARGS"):  # напр. доверие CA прокси: --ignore-certificate-errors-spki-list=<hash>
+        launch["args"] = os.environ["BROWSER_EXTRA_ARGS"].split()
+    if os.environ.get("CHROMIUM_EXECUTABLE"):
+        launch["executable_path"] = os.environ["CHROMIUM_EXECUTABLE"]
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(**launch)
         page = browser.new_page(locale="ru-RU", viewport={"width": 1400, "height": 1000})
         page.on("response", on_response)
         page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
