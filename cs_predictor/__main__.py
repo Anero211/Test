@@ -195,10 +195,11 @@ def cmd_upcoming(a, s: Settings) -> None:
 
 def cmd_betboom_dump(a, s: Settings) -> None:
     d = DATA_DIR / "betboom_dump"
-    payloads = betboom.capture_with_playwright(s.betboom_page_url, wait_seconds=a.wait, dump_dir=d)
-    events = [ev for p in payloads for ev in betboom.extract_events(p)]
-    print(f"Перехвачено JSON-ответов: {len(payloads)} → {d}; распознано матчей: {len(events)}")
-    for ev in events[:30]:
+    payloads, text = betboom.capture_with_playwright(s.betboom_page_url, wait_seconds=a.wait, dump_dir=d)
+    events = betboom.extract_from_text(text) + [ev for p in payloads for ev in betboom.extract_events(p)]
+    print(f"JSON-ответов: {len(payloads)}, строк текста: {text.count(chr(10))} → {d} (page.html, page.txt, page.png)")
+    print(f"Распознано матчей: {len(events)}")
+    for ev in events[:40]:
         print(f"  {ev.start} {ev.team1} vs {ev.team2}: {ev.odds1} / {ev.odds2} Bo{ev.best_of or '?'}")
 
 

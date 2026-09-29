@@ -230,3 +230,42 @@ def test_odds_log_attach(tmp_path):
     matcher = TeamMatcher(sorted(pred.engine.rating))
     assert attach_odds_log(hist, p, matcher) == 1
     assert (target.odds1, target.odds2) == (1.5, 2.4)  # ориентация по team1/team2 истории
+
+
+def test_betboom_text_extractor():
+    """Текст страницы линии (формат примерный — реальная вёрстка BetBoom может отличаться)."""
+    from cs_predictor.sources.betboom import extract_from_text
+    text = """Линия
+Кибер
+Counter-Strike
+ESL Pro League
+Сегодня
+19:30
+Bo3
+Natus Vincere
+G2
+П1
+1,72
+П2
+2,05
++45
+30 сентября
+12:00
+Spirit
+FaZe
+1.55
+2.40
+Футбол-матч
+Команда А
+Команда Б
+2.10
+3.30
+3.40
+"""
+    now = datetime(2026, 9, 29, 9, 0, tzinfo=timezone.utc)
+    evs = {(e.team1, e.team2): e for e in extract_from_text(text, now)}
+    assert set(evs) == {("Natus Vincere", "G2"), ("Spirit", "FaZe")}  # 3-исходный рынок пропущен
+    navi = evs[("Natus Vincere", "G2")]
+    assert (navi.odds1, navi.odds2, navi.best_of) == (1.72, 2.05, 3)
+    assert navi.start == datetime(2026, 9, 29, 16, 30, tzinfo=timezone.utc)  # 19:30 МСК
+    assert evs[("Spirit", "FaZe")].start == datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc)

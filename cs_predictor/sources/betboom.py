@@ -18,7 +18,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -211,51 +211,156 @@ def from_json_url(url: str) -> list[OddsEvent]:
     return extract_events(Fetcher(min_interval=1.0).get_json(url))
 
 
-def capture_with_playwright(page_url: str, wait_seconds: float = 12.0, dump_dir: Path | None = None) -> list[Any]:
-    """Открывает страницу в headless Chromium и собирает все JSON-ответы сайта."""
+# ---------------- разбор текста отрисованной страницы ----------------
+# Линия BetBoom приходит в браузер по WebSocket в protobuf, поэтому основной способ —
+# дать виджету отрисоваться и прочитать коэффициенты из текста страницы.
+
+_ODD_RE = re.compile(r"^\d{1,2}[.,]\d{1,3}$")
+_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+_DATE_RE = re.compile(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?")
+_MONTHS = {"янв": 1, "фев": 2, "мар": 3, "апр": 4, "мая": 5, "май": 5, "июн": 6, "июл": 7, "авг": 8,
+           "сен": 9, "окт": 10, "ноя": 11, "дек": 12}
+_LABELS = {"п1", "п2", "1", "2", "w1", "w2", "x", "н", "победа 1", "победа 2", "исход"}
+_UI_WORDS = {"линия", "кибер", "лайв", "live", "спорт", "войти", "регистрация", "главная", "все", "ещё", "еще",
+             "сегодня", "завтра", "избранное", "купон", "результаты", "counter-strike", "cs2", "dota 2"}
+
+
+def _is_name(line: str) -> bool:
+    low = line.lower()
+    return (0 < len(line) <= 40 and any(c.isalpha() for c in line) and low not in _LABELS
+            and low not in _UI_WORDS and not _ODD_RE.match(line) and not _TIME_RE.match(line)
+            and not re.search(r"\+\d+$|^\d+$|^bo\d$", low))
+
+
+def _parse_when(lines: list[str], now: datetime, tz) -> datetime | None:
+    """Ищет время/дату в строках над матчем (время на сайте — московское)."""
+    t = day = None
+    for ln in reversed(lines):
+        low = ln.lower()
+        m = _TIME_RE.match(ln) or re.search(r"(\d{1,2}):(\d{2})", ln)
+        if m and t is None:
+            t = (int(m.group(1)), int(m.group(2)))
+        if day is None:
+            local_now = now.astimezone(tz)
+            if "сегодня" in low:
+                day = local_now.date()
+            elif "завтра" in low:
+                day = (local_now + timedelta(days=1)).date()
+            else:
+                dm = _DATE_RE.search(ln)
+                mm = re.search(r"(\d{1,2})\s+([а-я]{3})", low)
+                try:
+                    if dm and not _ODD_RE.match(ln):
+                        day = local_now.date().replace(month=int(dm.group(2)), day=int(dm.group(1)))
+                    elif mm and mm.group(2) in _MONTHS:
+                        day = local_now.date().replace(month=_MONTHS[mm.group(2)], day=int(mm.group(1)))
+                except ValueError:
+                    pass
+    if t is None:
+        return None
+    day = day or now.astimezone(tz).date()
+    return datetime(day.year, day.month, day.day, t[0], t[1], tzinfo=tz).astimezone(timezone.utc)
+
+
+def extract_from_text(text: str, now: datetime | None = None) -> list[OddsEvent]:
+    """Эвристика: «Команда 1 / Команда 2 / [П1] кэф / [П2] кэф» (3 исхода подряд — рынок с ничьей, пропуск)."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Europe/Moscow")
+    now = now or datetime.now(timezone.utc)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    out: dict[tuple, OddsEvent] = {}
+    i = 0
+    while i < len(lines) - 3:
+        a, b = lines[i], lines[i + 1]
+        if not (_is_name(a) and _is_name(b)) or a == b:
+            i += 1
+            continue
+        odds, j = [], i + 2
+        while j < len(lines) and j < i + 9 and len(odds) < 3:
+            ln = lines[j]
+            if _ODD_RE.match(ln):
+                odds.append(float(ln.replace(",", ".")))
+            elif ln.lower() not in _LABELS and not re.match(r"^bo\d$|^\+\d+$", ln.lower()):
+                break
+            j += 1
+        if len(odds) == 2 and all(1.01 < o < 50 for o in odds) and 1 / odds[0] + 1 / odds[1] > 0.98:
+            ctx = lines[max(0, i - 4):i]
+            bo = next((int(m.group(1)) for ln in ctx + lines[i + 2:j + 2] if (m := _BO_RE.search(ln))), None)
+            out[(a.lower(), b.lower())] = OddsEvent(a, b, odds[0], odds[1], _parse_when(ctx, now, tz), bo)
+            i = j
+        else:
+            i += 1
+    return list(out.values())
+
+
+# ---------------- режимы получения ----------------
+
+def from_json_url(url: str) -> list[OddsEvent]:
+    from .http import Fetcher
+    return extract_events(Fetcher(min_interval=1.0).get_json(url))
+
+
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+
+
+def capture_with_playwright(page_url: str, wait_seconds: float = 20.0,
+                            dump_dir: Path | None = None) -> tuple[list[Any], str]:
+    """Открывает страницу в headless Chromium; возвращает (все JSON-ответы, текст отрисованной страницы)."""
+    import os
     from playwright.sync_api import sync_playwright
 
     payloads: list[Any] = []
+    if dump_dir:
+        dump_dir.mkdir(parents=True, exist_ok=True)
 
     def on_response(resp):
         try:
             if "json" in (resp.headers.get("content-type") or ""):
                 payloads.append(resp.json())
                 if dump_dir:
-                    dump_dir.mkdir(parents=True, exist_ok=True)
                     name = re.sub(r"[^\w.-]+", "_", resp.url.split("//", 1)[-1])[:150]
                     (dump_dir / f"{len(payloads):03d}_{name}.json").write_text(
                         json.dumps(payloads[-1], ensure_ascii=False, indent=1), encoding="utf-8")
         except Exception:
             pass
 
-    import os
-    launch: dict[str, Any] = {"headless": True}
+    # Без «HeadlessChrome» в User-Agent: иначе сервер линии BetBoom отказывает
+    launch: dict[str, Any] = {"headless": True, "args": ["--disable-blink-features=AutomationControlled"]}
     if os.environ.get("HTTPS_PROXY"):  # корпоративный/облачный прокси
         launch["proxy"] = {"server": os.environ["HTTPS_PROXY"]}
     if os.environ.get("BROWSER_EXTRA_ARGS"):  # напр. доверие CA прокси: --ignore-certificate-errors-spki-list=<hash>
-        launch["args"] = os.environ["BROWSER_EXTRA_ARGS"].split()
+        launch["args"] += os.environ["BROWSER_EXTRA_ARGS"].split()
     if os.environ.get("CHROMIUM_EXECUTABLE"):
         launch["executable_path"] = os.environ["CHROMIUM_EXECUTABLE"]
     with sync_playwright() as p:
         browser = p.chromium.launch(**launch)
-        page = browser.new_page(locale="ru-RU", viewport={"width": 1400, "height": 1000})
+        page = browser.new_context(locale="ru-RU", user_agent=_UA, timezone_id="Europe/Moscow",
+                                   viewport={"width": 1400, "height": 1000}).new_page()
         page.on("response", on_response)
         page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
-        deadline = wait_seconds * 1000
-        step = 1500
-        waited = 0
-        while waited < deadline:  # прокручиваем, чтобы подгрузилась вся линия
+        texts = []
+        waited, step = 0, 1500
+        while waited < wait_seconds * 1000:  # прокручиваем, чтобы подгрузилась вся линия
             page.mouse.wheel(0, 2500)
             page.wait_for_timeout(step)
             waited += step
+            texts.append(page.inner_text("body"))  # виртуальные списки: собираем текст по ходу прокрутки
+        text = "\n".join(texts)
+        if dump_dir:
+            (dump_dir / "page.html").write_text(page.content(), encoding="utf-8")
+            (dump_dir / "page.txt").write_text(text, encoding="utf-8")
+            page.screenshot(path=str(dump_dir / "page.png"), full_page=True)
         browser.close()
-    return payloads
+    return payloads, text
 
 
 def from_playwright(page_url: str, dump_dir: Path | None = None) -> list[OddsEvent]:
+    payloads, text = capture_with_playwright(page_url, dump_dir=dump_dir)
     events: dict[tuple, OddsEvent] = {}
-    for payload in capture_with_playwright(page_url, dump_dir=dump_dir):
+    for ev in extract_from_text(text):
+        events[(ev.team1.lower(), ev.team2.lower())] = ev
+    for payload in payloads:  # JSON, если сайт его всё же отдаёт, точнее текста
         for ev in extract_events(payload):
             events[(ev.team1.lower(), ev.team2.lower())] = ev
     return list(events.values())
