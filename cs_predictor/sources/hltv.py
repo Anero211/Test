@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from bs4 import BeautifulSoup
 
@@ -116,13 +117,18 @@ def parse_upcoming_page(html: str) -> list[dict]:
         meta = _text(el.select_one(".matchMeta, .match-meta"))
         bo = _BO_RE.search(meta)
         if len(names) >= 2 and ts:
-            item = {"team1": names[0], "team2": names[1], "start": parse_dt(ts),
-                    "best_of": int(bo.group(1)) if bo else None,
+            best_of = int(bo.group(1)) if bo else None
+            if best_of is None and meta.strip().lower() in set(MAP_ABBR) | set(MAP_ABBR.values()):
+                best_of = 1  # для Bo1 с известной картой HLTV пишет карту вместо «bo1»
+            item = {"team1": names[0], "team2": names[1], "start": parse_dt(ts), "best_of": best_of,
                     "event": _text(el.select_one(".matchEventName, .match-event")), "source": "hltv"}
             key = (item["team1"], item["team2"], item["start"])
             # в новой вёрстке блоки вложены друг в друга — оставляем самый полный
-            if key not in out or (item["event"] and not out[key]["event"]):
+            if key not in out:
                 out[key] = item
+            else:  # объединяем: у одного блока может быть формат, у другого — турнир
+                for k in ("best_of", "event"):
+                    out[key][k] = out[key][k] or item[k]
     return list(out.values())
 
 
@@ -161,5 +167,19 @@ class HLTVClient:
                         log.warning("карты %s: %s", m.match_id, e)
         return matches
 
-    def upcoming(self) -> list[dict]:
-        return parse_upcoming_page(self.f.get_text(f"{BASE}/matches"))
+    def upcoming(self, cache: "Path | None" = None, max_age_hours: float = 12) -> list[dict]:
+        """Расписание. Удачный ответ кэшируется; если HLTV временно блокирует (Cloudflare),
+        используется кэш не старше max_age_hours."""
+        import time as _t
+        try:
+            html = self.f.get_text(f"{BASE}/matches")
+        except Exception as e:
+            if cache and cache.exists() and _t.time() - cache.stat().st_mtime < max_age_hours * 3600:
+                age = (_t.time() - cache.stat().st_mtime) / 3600
+                log.warning("HLTV недоступен (%s) — беру расписание из кэша (%.1f ч назад)", e, age)
+                return parse_upcoming_page(cache.read_text(encoding="utf-8"))
+            raise
+        if cache:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(html, encoding="utf-8")
+        return parse_upcoming_page(html)

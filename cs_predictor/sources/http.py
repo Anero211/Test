@@ -18,11 +18,11 @@ BROWSER_HEADERS = {
 
 # Профили браузеров для curl_cffi. Cloudflare на HLTV пропускает их по-разному,
 # поэтому при 403 переключаемся на следующий.
-PROFILES = ["safari17_0", "edge101", "chrome", "firefox133", "safari18_0"]
+PROFILES = ["safari17_0", "edge101", "chrome", "firefox133", "safari18_0", "chrome120", "safari15_5", "edge99"]
 
 
 class Fetcher:
-    def __init__(self, min_interval: float = 2.5, retries: int = 6, timeout: float = 30.0):
+    def __init__(self, min_interval: float = 2.5, retries: int = 12, timeout: float = 30.0):
         self.min_interval = min_interval
         self.retries = retries
         self.timeout = timeout
@@ -70,6 +70,7 @@ class Fetcher:
                     self._profile += 1
                     self._new_session()
                     log.info("403 — меняю профиль браузера на %s", PROFILES[self._profile % len(PROFILES)])
+                    time.sleep(3 + 2 * attempt)  # Cloudflare остывает не сразу
                     continue
             delay = 2 ** (attempt + 1)
             log.warning("%s — повтор через %ss", last_err, delay)

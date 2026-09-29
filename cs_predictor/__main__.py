@@ -102,7 +102,7 @@ def _schedule(s: Settings, hours: float) -> list[dict]:
             log.warning("PandaScore расписание: %s", e)
     try:
         from .sources.hltv import HLTVClient
-        out += HLTVClient().upcoming()
+        out += HLTVClient().upcoming(cache=DATA_DIR / "hltv_upcoming_cache.html")
     except Exception as e:
         log.warning("HLTV расписание: %s", e)
     return out
@@ -126,9 +126,15 @@ def run_hltv_predict(s: Settings, hours: float, top: int, formats: tuple[int, ..
     now = datetime.now(timezone.utc)
     items: list[MatchStrategy] = []
     skipped = []
-    for u in _schedule(s, hours):
-        start, bo = u.get("start"), u.get("best_of") or 3
+    schedule = _schedule(s, hours)
+    if not schedule:
+        sys.exit("Расписание не получено (HLTV недоступен или заблокировал запрос) — повтори через пару минут")
+    for u in schedule:
+        start, bo = u.get("start"), u.get("best_of")
         if not start or not (now - timedelta(minutes=15) <= start <= now + timedelta(hours=hours)):
+            continue
+        if bo is None:
+            skipped.append(f"{u['team1']} – {u['team2']} (формат неизвестен)")
             continue
         if bo not in formats:
             continue
