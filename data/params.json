@@ -1,0 +1,12 @@
+{
+ "init": 1500.0,
+ "k": 20,
+ "k_new": 48.0,
+ "new_games": 15,
+ "k_map": 0.0,
+ "map_offset_cap": 150.0,
+ "scale": 400.0,
+ "inactivity_days": 45,
+ "inactivity_shrink": 0.15,
+ "form_window": 10
+}

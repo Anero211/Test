@@ -6,4 +6,6 @@ venv/
 .pytest_cache/
 data/*
 !data/aliases.json
+!data/matches.csv
+!data/params.json
 output/
