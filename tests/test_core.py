@@ -269,3 +269,50 @@ FaZe
     assert (navi.odds1, navi.odds2, navi.best_of) == (1.72, 2.05, 3)
     assert navi.start == datetime(2026, 9, 29, 16, 30, tzinfo=timezone.utc)  # 19:30 МСК
     assert evs[("Spirit", "FaZe")].start == datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc)
+
+
+# ---------- стратегия по картам ----------
+
+def test_score_distribution_consistent():
+    from cs_predictor.strategy import score_distribution
+    for p1 in (0.2, 0.5, 0.74):
+        for p3 in (None, 0.30, 0.45):
+            sc = score_distribution(p1, 3, p3)
+            assert sum(sc.values()) == pytest.approx(1)
+            assert sc[(2, 0)] + sc[(2, 1)] == pytest.approx(p1)  # согласовано с победой в серии
+            assert all(v >= -1e-12 for v in sc.values())
+            if p3 is not None:
+                assert sc[(2, 1)] + sc[(1, 2)] == pytest.approx(p3)
+    sc5 = score_distribution(0.65, 5)
+    assert sum(sc5.values()) == pytest.approx(1)
+    assert sum(v for (a, b), v in sc5.items() if a > b) == pytest.approx(0.65, abs=1e-6)
+
+
+def test_build_strategy_markets():
+    from cs_predictor.model import Prediction
+    from cs_predictor.strategy import build_strategy, match_card, summary_table
+    pr = Prediction("A", "B", 3, 0.7, 0.7, 100, 80, {}, p3=0.4)
+    st = build_strategy(pr, T0, "Cup", "Alpha", "Beta", margin=0.07)
+    win = st.market("П1 Alpha")
+    assert win.p == pytest.approx(0.7) and win.fair_odds == pytest.approx(1 / 0.7)
+    assert win.min_odds == pytest.approx(1.07 / 0.7) and win.risk == "низкий"
+    assert st.market("Тотал карт Б 2.5").p == pytest.approx(0.4)
+    assert st.market("Фора Beta +1.5").p == pytest.approx(1 - st.market("Счёт 2:0 Alpha").p)
+    roles = [r for r, _ in st.picks]
+    assert roles == ["основная", "рискованная", "по картам", "страховка андердога"]
+    assert st.picks[0][1].label == "П1 Alpha"
+    # у команды с короткой историей запас больше
+    thin = build_strategy(Prediction("A", "B", 3, 0.7, 0.7, 100, 20, {}, p3=0.4), T0, "", "Alpha", "Beta")
+    assert thin.market("П1 Alpha").min_odds == pytest.approx(1.12 / 0.7)
+    assert "Alpha" in summary_table([st]) and "Все рынки" in match_card(st)
+
+
+def test_map_count_model_learns_bias():
+    from cs_predictor.model import MapCountModel
+    rng = np.random.default_rng(1)
+    ps = list(rng.uniform(0.3, 0.8, 3000))
+    # реальность: 3 карты реже, чем по наивной формуле
+    ys = [float(rng.random() < MapCountModel.naive(p) - 0.06) for p in ps]
+    m = MapCountModel()
+    m.fit(ps, ys)
+    assert m.predict(0.5) == pytest.approx(0.44, abs=0.03)

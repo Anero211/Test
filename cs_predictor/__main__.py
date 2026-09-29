@@ -3,9 +3,9 @@
   collect       — скачать историю матчей (HLTV и/или PandaScore) в data/matches.csv
   backtest      — проверить модель на прошлых матчах (walk-forward)
   tune          — подобрать параметры Elo на истории (сохраняются в data/params.json)
-  predict       — линия BetBoom на 1–2 дня → прогнозы, EV, сигналы (+ Telegram)
-  watch         — predict в цикле раз в N секунд
-  upcoming      — прогнозы на ближайшие матчи по расписанию HLTV (без коэффициентов)
+  predict       — предстоящие матчи HLTV: вероятности, счёт по картам, с какого кэфа ставить
+  watch         — predict в цикле + новые матчи в Telegram
+  betboom       — сверка прогнозов с линией BetBoom (EV, сигналы) — только на своём компьютере
   betboom-dump  — сохранить все JSON-ответы сайта BetBoom (для настройки парсера)
   demo          — всё то же на синтетических данных (проверка установки без интернета)
 """
@@ -22,6 +22,7 @@ from . import backtest as bt
 from .config import DATA_DIR, OUTPUT_DIR, Settings
 from .model import Predictor
 from .names import TeamMatcher
+from .strategy import MatchStrategy, build_strategy, fmt_time, match_card, summary_table, telegram_text
 from .signals import evaluate, format_table, log_odds, most_probable, save_rows
 from .sources import betboom
 from .storage import load_matches, merge_matches, parse_dt, save_matches
@@ -107,24 +108,132 @@ def _schedule(s: Settings, hours: float) -> list[dict]:
     return out
 
 
-def run_predict(s: Settings, mode: str, telegram: bool, refresh: bool, top: int) -> None:
+def _load_predictor(s: Settings, refresh: bool) -> Predictor:
     if refresh:  # подтягиваем свежие результаты (последние ~3 дня)
-        a = argparse.Namespace(source="all", pages=2, days=3, maps=False)
-        cmd_collect(a, s)
+        cmd_collect(argparse.Namespace(source="all", pages=3, days=3, maps=False), s)
     matches = load_matches(s.matches_csv)
     if not matches:
         sys.exit("История пуста — сначала `python -m cs_predictor collect`")
-    predictor = Predictor(bt.load_params(PARAMS)).train(matches)
-    matcher = TeamMatcher(sorted(predictor.engine.rating), s.aliases_json)
+    return Predictor(bt.load_params(PARAMS)).train(matches)
 
-    line = betboom.fetch_line(mode, s.betboom_page_url, s.betboom_json_url, s.betboom_manual_csv)
+
+# ---------------- основной режим: матчи HLTV → стратегия ----------------
+
+def run_hltv_predict(s: Settings, hours: float, top: int, formats: tuple[int, ...], refresh: bool,
+                     margin: float, quiet: bool = False) -> list[MatchStrategy]:
+    predictor = _load_predictor(s, refresh)
+    matcher = TeamMatcher(sorted(predictor.engine.rating), s.aliases_json)
+    now = datetime.now(timezone.utc)
+    items: list[MatchStrategy] = []
+    skipped = []
+    for u in _schedule(s, hours):
+        start, bo = u.get("start"), u.get("best_of") or 3
+        if not start or not (now - timedelta(minutes=15) <= start <= now + timedelta(hours=hours)):
+            continue
+        if bo not in formats:
+            continue
+        t1, t2 = matcher.match(u["team1"])[0], matcher.match(u["team2"])[0]
+        if not (t1 and t2) or t1 == t2:
+            skipped.append(f"{u['team1']} – {u['team2']} (команда не найдена в истории)")
+            continue
+        pr = predictor.predict(t1, t2, bo, start)
+        if min(pr.games1, pr.games2) < s.min_team_games:
+            skipped.append(f"{u['team1']} – {u['team2']} (мало матчей в истории)")
+            continue
+        items.append(build_strategy(pr, start, u.get("event", ""), u["team1"], u["team2"], margin=margin))
+    # дубли из разных источников расписания
+    uniq = {}
+    for st in items:
+        uniq.setdefault((frozenset((st.team1.lower(), st.team2.lower())), st.start.date() if st.start else None), st)
+    items = sorted(uniq.values(), key=lambda st: -st.fav_p)
+
+    stamp = datetime.now(timezone.utc)
+    parts = [f"=== Прогнозы CS2 на {hours:.0f} ч по расписанию HLTV — {fmt_time(stamp)} МСК ===",
+             f"«Ставить от» = минимальный коэффициент, при котором ставка выгодна с запасом {margin:.0%} "
+             f"(+5% для команд с короткой историей). Ниже этого кэфа — пропускать.", "",
+             summary_table(items), ""]
+    parts += [match_card(st, i) + "\n" for i, st in enumerate(items[:top], 1)]
+    if skipped:
+        parts.append(f"Пропущено {len(skipped)} матчей: " + "; ".join(skipped[:15]) + (" …" if len(skipped) > 15 else ""))
+    text = "\n".join(parts)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    name = f"strategy_{stamp:%Y%m%d_%H%M}"
+    (OUTPUT_DIR / f"{name}.txt").write_text(text, encoding="utf-8")
+    _save_markets(items, OUTPUT_DIR / f"{name}.csv")
+    if not quiet:
+        print(text)
+        print(f"\nСохранено: {OUTPUT_DIR / (name + '.txt')} и .csv (все рынки)")
+    return items
+
+
+def _save_markets(items: list[MatchStrategy], path) -> None:
+    import csv
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["start_msk", "team1", "team2", "best_of", "event", "market", "probability",
+                    "fair_odds", "min_odds", "risk", "games1", "games2"])
+        for st in items:
+            for mk in st.markets:
+                w.writerow([fmt_time(st.start), st.team1, st.team2, st.best_of, st.event, mk.label,
+                            f"{mk.p:.4f}", f"{mk.fair_odds:.3f}", f"{mk.min_odds:.3f}", mk.risk, st.games1, st.games2])
+
+
+def _formats(a) -> tuple[int, ...]:
+    return (1, 3, 5) if a.bo1 else (3, 5)
+
+
+def cmd_predict(a, s: Settings) -> None:
+    items = run_hltv_predict(s, a.hours, a.top, _formats(a), not a.no_update, a.margin)
+    if a.telegram:
+        _send_telegram(items[:a.top], s)
+
+
+def _send_telegram(items: list[MatchStrategy], s: Settings) -> None:
+    import json
+    from .notify import send_telegram
+    if not (s.telegram_token and s.telegram_chat_id):
+        log.warning("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
+        return
+    sent = json.loads(s.sent_json.read_text()) if s.sent_json.exists() else {}
+    n = 0
+    for st in items:
+        key = f"{fmt_time(st.start)}|{st.team1}|{st.team2}"
+        if key not in sent and send_telegram(s.telegram_token, s.telegram_chat_id, telegram_text(st)):
+            sent[key] = round(st.fav_p, 3)
+            n += 1
+    s.sent_json.parent.mkdir(parents=True, exist_ok=True)
+    s.sent_json.write_text(json.dumps(sent, ensure_ascii=False, indent=1))
+    print(f"В Telegram отправлено: {n}")
+
+
+def cmd_watch(a, s: Settings) -> None:
+    """Каждые N минут: обновить историю и расписание, прислать в Telegram новые матчи."""
+    while True:
+        try:
+            items = run_hltv_predict(s, a.hours, a.top, _formats(a), True, a.margin, quiet=True)
+            _send_telegram(items[:a.top], s)
+        except SystemExit as e:
+            log.error("%s", e)
+        except Exception:
+            log.exception("ошибка цикла")
+        time.sleep(a.interval + random.uniform(0, 30))
+
+
+# ---------------- режим с линией BetBoom (запускать на своём компьютере) ----------------
+
+def cmd_betboom(a, s: Settings) -> None:
+    if a.hours:
+        s.horizon_hours = a.hours
+    predictor = _load_predictor(s, not a.no_update)
+    matcher = TeamMatcher(sorted(predictor.engine.rating), s.aliases_json)
+    line = betboom.fetch_line(a.mode, s.betboom_page_url, s.betboom_json_url, s.betboom_manual_csv)
     if not line:
         sys.exit("Линия BetBoom пуста. Варианты: BETBOOM_JSON_URL из DevTools, `betboom-dump`, "
                  "или заполни data/betboom_manual.csv")
     log_odds(line, s.odds_log_csv)
     need_schedule = any(ev.best_of is None for ev in line)
     rows = evaluate(line, predictor, matcher, _schedule(s, s.horizon_hours) if need_schedule else [], s)
-    _output(rows, s, top, telegram)
+    _output(rows, s, a.top, a.telegram)
 
 
 def _output(rows, s: Settings, top: int, telegram: bool) -> None:
@@ -141,56 +250,6 @@ def _output(rows, s: Settings, top: int, telegram: bool) -> None:
         else:
             from .notify import send_new_signals
             print(f"В Telegram отправлено сигналов: {send_new_signals(rows, s.telegram_token, s.telegram_chat_id, s.sent_json)}")
-
-
-def cmd_predict(a, s: Settings) -> None:
-    if a.hours:
-        s.horizon_hours = a.hours
-    run_predict(s, a.mode, a.telegram, not a.no_update, a.top)
-
-
-def cmd_watch(a, s: Settings) -> None:
-    last_refresh = 0.0
-    while True:
-        refresh = time.time() - last_refresh > 3600  # историю обновляем раз в час
-        try:
-            run_predict(s, a.mode, True, refresh, a.top)
-            if refresh:
-                last_refresh = time.time()
-        except SystemExit as e:
-            log.error("%s", e)
-        except Exception:
-            log.exception("ошибка цикла")
-        time.sleep(a.interval + random.uniform(0, 15))
-
-
-def cmd_upcoming(a, s: Settings) -> None:
-    """Прогнозы на ближайшие матчи по расписанию HLTV/PandaScore — без коэффициентов БК."""
-    matches = load_matches(s.matches_csv)
-    if not matches:
-        sys.exit("История пуста — сначала `python -m cs_predictor collect`")
-    predictor = Predictor(bt.load_params(PARAMS)).train(matches)
-    matcher = TeamMatcher(sorted(predictor.engine.rating), s.aliases_json)
-    now = datetime.now(timezone.utc)
-    rows = []
-    for u in _schedule(s, a.hours):
-        start, bo = u.get("start"), u.get("best_of") or 3
-        if not start or not (now - timedelta(hours=1) <= start <= now + timedelta(hours=a.hours)):
-            continue
-        t1, t2 = matcher.match(u["team1"])[0], matcher.match(u["team2"])[0]
-        if not (t1 and t2) or t1 == t2:
-            continue
-        pr = predictor.predict(t1, t2, bo, start)
-        if min(pr.games1, pr.games2) < s.min_team_games or (a.bo3 and bo != 3):
-            continue
-        fav, p = (u["team1"], pr.p) if pr.p >= 0.5 else (u["team2"], 1 - pr.p)
-        rows.append((p, start, u, bo, fav))
-    rows.sort(key=lambda r: -r[0])
-    print(f"=== Прогнозы на {a.hours:.0f} ч по расписанию HLTV (без коэффициентов), по убыванию уверенности ===")
-    print(f"{'Начало (UTC)':<16} {'Матч':<42} {'Bo':<3} {'Фаворит модели':<22} {'P':>6}  {'Мин. кэф для EV≥' + format(s.min_ev, '.0%'):>18}  Турнир")
-    for p, start, u, bo, fav in rows[:a.top]:
-        print(f"{start:%Y-%m-%d %H:%M} {(u['team1'] + ' vs ' + u['team2'])[:42]:<42} {bo:<3} {fav[:22]:<22} "
-              f"{p:>6.1%}  {(1 + s.min_ev) / p:>18.2f}  {u.get('event', '')[:40]}")
 
 
 def cmd_betboom_dump(a, s: Settings) -> None:
@@ -245,22 +304,25 @@ def main(argv: list[str] | None = None) -> None:
     t.set_defaults(func=cmd_tune)
 
     for name, fn in (("predict", cmd_predict), ("watch", cmd_watch)):
-        x = sub.add_parser(name)
-        x.add_argument("--mode", choices=["auto", "playwright", "url", "csv"], default="auto", help="источник линии BetBoom")
-        x.add_argument("--top", type=int, default=10)
+        x = sub.add_parser(name, help="матчи HLTV → вероятности, счёт по картам, с какого кэфа ставить")
+        x.add_argument("--hours", type=float, default=48, help="горизонт, часов")
+        x.add_argument("--top", type=int, default=15, help="сколько подробных карточек выводить")
+        x.add_argument("--bo1", action="store_true", help="включить Bo1 (по умолчанию только Bo3/Bo5)")
+        x.add_argument("--margin", type=float, default=0.07, help="запас прочности: минимальный EV (0.07 = 7%%)")
         if name == "predict":
-            x.add_argument("--hours", type=float, help="горизонт, часов (по умолчанию 48)")
             x.add_argument("--telegram", action="store_true")
             x.add_argument("--no-update", action="store_true", help="не обновлять историю перед прогнозом")
         else:
-            x.add_argument("--interval", type=int, default=120, help="секунд между опросами линии")
+            x.add_argument("--interval", type=int, default=1800, help="секунд между обновлениями")
         x.set_defaults(func=fn)
 
-    u = sub.add_parser("upcoming", help="прогнозы по расписанию HLTV без коэффициентов")
-    u.add_argument("--hours", type=float, default=48)
-    u.add_argument("--top", type=int, default=25)
-    u.add_argument("--bo3", action="store_true", help="только Bo3")
-    u.set_defaults(func=cmd_upcoming)
+    bb = sub.add_parser("betboom", help="сверка с линией BetBoom (только на своём компьютере)")
+    bb.add_argument("--mode", choices=["auto", "playwright", "url", "csv"], default="auto")
+    bb.add_argument("--top", type=int, default=10)
+    bb.add_argument("--hours", type=float)
+    bb.add_argument("--telegram", action="store_true")
+    bb.add_argument("--no-update", action="store_true")
+    bb.set_defaults(func=cmd_betboom)
 
     d = sub.add_parser("betboom-dump")
     d.add_argument("--wait", type=float, default=20)

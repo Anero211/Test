@@ -30,6 +30,9 @@ class BTRow:
     games2: int
     odds1: float | None
     odds2: float | None
+    score1: int = 0
+    score2: int = 0
+    p3: float | None = None  # Bo3: прогноз вероятности 3-й карты
 
 
 def run_backtest(matches: list[Match], since: datetime | None = None, until: datetime | None = None,
@@ -44,7 +47,7 @@ def run_backtest(matches: list[Match], since: datetime | None = None, until: dat
             rows.append(BTRow(
                 date=m.date.isoformat(), event=m.event, team1=m.team1, team2=m.team2, best_of=m.best_of,
                 p_elo=pr.p_elo, p=pr.p, win1=int(m.winner == 1), games1=pr.games1, games2=pr.games2,
-                odds1=m.odds1, odds2=m.odds2,
+                odds1=m.odds1, odds2=m.odds2, score1=m.score1, score2=m.score2, p3=pr.p3,
             ))
         pred.observe(m)
         since_fit += 1
@@ -92,6 +95,47 @@ def confidence_table(rows: list[BTRow], thresholds=(0.55, 0.6, 0.65, 0.7, 0.75, 
         sel = [_pick(r) for r in rows if _pick(r)[0] >= t]
         out.append({"threshold": t, "n": len(sel), "share": len(sel) / max(len(rows), 1),
                     "acc": (sum(h for _, h in sel) / len(sel)) if sel else float("nan")})
+    return out
+
+
+def map_markets_report(rows: list[BTRow]) -> list[str]:
+    """Калибровка рынков, которые выдаёт `predict`: 2:0 фаворита, тотал карт, фора андердога +1.5."""
+    from .model import MapCountModel
+    from .strategy import score_distribution
+    bo3 = [r for r in rows if r.best_of == 3 and r.p3 is not None and r.score1 + r.score2 in (2, 3)]
+    if not bo3:
+        return ["Нет Bo3 с картами в тестовом периоде."]
+    markets: dict[str, list[tuple[float, bool]]] = defaultdict(list)
+    naive3 = []
+    for r in bo3:
+        sc = score_distribution(r.p, 3, r.p3)
+        fav1 = r.p >= 0.5
+        went3 = r.score1 + r.score2 == 3
+        fav_dry = (r.score1, r.score2) == ((2, 0) if fav1 else (0, 2))
+        dog_dry = (r.score1, r.score2) == ((0, 2) if fav1 else (2, 0))
+        markets["Тотал карт Б 2.5"].append((sc[(2, 1)] + sc[(1, 2)], went3))
+        markets["Тотал карт М 2.5"].append((sc[(2, 0)] + sc[(0, 2)], not went3))
+        markets["Счёт 2:0 фаворита (= фора −1.5)"].append((sc[(2, 0)] if fav1 else sc[(0, 2)], fav_dry))
+        markets["Фора андердога +1.5"].append((1 - (sc[(2, 0)] if fav1 else sc[(0, 2)]), not fav_dry))
+        markets["Счёт 2:0 андердога"].append((sc[(0, 2)] if fav1 else sc[(2, 0)], dog_dry))
+        naive3.append((MapCountModel.naive(r.p), went3))
+    out = ["| Рынок | N | Средняя вероятность модели | Факт | Brier |", "|---|---|---|---|---|"]
+    for name, xs in markets.items():
+        n = len(xs)
+        out.append(f"| {name} | {n} | {sum(p for p, _ in xs) / n:.1%} | {sum(h for _, h in xs) / n:.1%} | "
+                   f"{sum((p - h) ** 2 for p, h in xs) / n:.3f} |")
+    n = len(naive3)
+    out += ["", f"Для сравнения: наивная формула «карты независимы» обещала 3 карты в "
+            f"{sum(p for p, _ in naive3) / n:.1%} матчей (Brier {sum((p - h) ** 2 for p, h in naive3) / n:.3f}).",
+            "", "Тотал карт Б 2.5 по корзинам уверенности модели:", "",
+            "| P(3 карты) | N | Модель | Факт |", "|---|---|---|---|"]
+    buckets = defaultdict(list)
+    for p, hit in markets["Тотал карт Б 2.5"]:
+        buckets[min(int(p * 20) / 20, 0.5)].append((p, hit))
+    for k in sorted(buckets):
+        xs = buckets[k]
+        out.append(f"| {k:.0%}–{k + 0.05:.0%} | {len(xs)} | {sum(p for p, _ in xs) / len(xs):.1%} | "
+                   f"{sum(h for _, h in xs) / len(xs):.1%} |")
     return out
 
 
@@ -175,10 +219,11 @@ def report(rows: list[BTRow], s: Settings, title: str = "Бэктест") -> str
     for n in (1, 3, 5):
         t = top_daily(est, n)
         lines.append(f"- топ-{n} в день: {t['n']} прогнозов за {t['days']} дней, точность {_fmt(t['acc'], True)}")
+    lines += ["", "## Рынки по картам (Bo3, опытные команды): обещано vs факт", ""] + map_markets_report(est)
     sim = betting_sim(rows, s)
     lines += ["", f"## Симуляция ставок по фильтру (Bo3, кэф {s.min_odds}–{s.max_odds}, EV ≥ {s.min_ev:.0%})", ""]
     if sim["matches_with_odds"] == 0:
-        lines.append("Нет исторических коэффициентов — ROI не считается. Запускай `watch`/`predict`: "
+        lines.append("Нет исторических коэффициентов — ROI не считается. Режим `betboom` (на своём компьютере) "
                      "скрипт копит снимки линии BetBoom в data/odds_log.csv, потом "
                      "`backtest --odds-log` посчитает реальную доходность стратегии.")
     else:
