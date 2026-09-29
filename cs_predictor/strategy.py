@@ -178,7 +178,8 @@ def summary_table(items: list[MatchStrategy]) -> str:
 
 def match_card(st: MatchStrategy, n: int | None = None, all_markets: bool = True) -> str:
     title = f"{n}. " if n else ""
-    lines = [f"━━ {title}{st.team1} vs {st.team2} — Bo{st.best_of}, {fmt_time(st.start)} МСК, {st.event}",
+    head = ", ".join(x for x in (f"Bo{st.best_of}", f"{fmt_time(st.start)} МСК" if st.start else "", st.event) if x)
+    lines = [f"━━ {title}{st.team1} vs {st.team2} — {head}",
              f"   История в базе: {st.games1} / {st.games2} матчей"
              + (f"   ⚠ {st.note}" if st.note else "")]
     if st.best_of > 1:

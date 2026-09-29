@@ -46,6 +46,10 @@ python -m cs_predictor predict --hours 24 --top 5        # 5 подробных 
 python -m cs_predictor predict --bo1                     # включить Bo1 (по умолчанию только Bo3/Bo5)
 python -m cs_predictor predict --margin 0.10             # более осторожный запас: 10%
 
+# 3b. Прогноз для своих матчей (команды ищутся в базе нечётким поиском: NAVI = Natus Vincere)
+python -m cs_predictor match "NAVI" "G2" --bo 3
+python -m cs_predictor match --file my_matches.txt       # по строке: «Vitality vs Spirit bo3»
+
 # 4. Раз в 30 минут обновлять прогнозы и присылать новые матчи в Telegram
 python -m cs_predictor watch
 ```

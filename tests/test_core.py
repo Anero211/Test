@@ -316,3 +316,9 @@ def test_map_count_model_learns_bias():
     m = MapCountModel()
     m.fit(ps, ys)
     assert m.predict(0.5) == pytest.approx(0.44, abs=0.03)
+
+
+def test_parse_match_lines():
+    from cs_predictor.__main__ import parse_match_lines
+    text = "Vitality vs Spirit bo3\nNAVI - G2\nMOUZ — FaZe Bo5\n# комментарий\nбез разделителя\n"
+    assert parse_match_lines(text) == [("Vitality", "Spirit", 3), ("NAVI", "G2", 3), ("MOUZ", "FaZe", 5)]

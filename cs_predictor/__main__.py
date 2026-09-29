@@ -5,6 +5,7 @@
   tune          — подобрать параметры Elo на истории (сохраняются в data/params.json)
   predict       — предстоящие матчи HLTV: вероятности, счёт по картам, с какого кэфа ставить
   watch         — predict в цикле + новые матчи в Telegram
+  match         — прогноз для своих матчей: match "NAVI" "G2" --bo 3  или  match --file list.txt
   betboom       — сверка прогнозов с линией BetBoom (EV, сигналы) — только на своём компьютере
   betboom-dump  — сохранить все JSON-ответы сайта BetBoom (для настройки парсера)
   demo          — всё то же на синтетических данных (проверка установки без интернета)
@@ -225,6 +226,65 @@ def cmd_watch(a, s: Settings) -> None:
         time.sleep(a.interval + random.uniform(0, 30))
 
 
+# ---------------- произвольные матчи, присланные вручную ----------------
+
+_LINE_RE = r"^\s*(.+?)\s+(?:vs\.?|v|-|–|—)\s+(.+?)(?:\s+bo\s*([1-5]))?\s*$"
+
+
+def parse_match_lines(text: str, default_bo: int = 3) -> list[tuple[str, str, int]]:
+    """«NAVI vs G2 bo3», «Spirit - FaZe», «Vitality — MOUZ Bo5» → [(team1, team2, best_of)]."""
+    import re
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(_LINE_RE, line, re.I)
+        if m:
+            out.append((m.group(1).strip(), m.group(2).strip(), int(m.group(3) or default_bo)))
+        else:
+            log.warning("не понял строку: %s", line)
+    return out
+
+
+def cmd_match(a, s: Settings) -> None:
+    pairs = []
+    if a.file:
+        from pathlib import Path
+        pairs += parse_match_lines(Path(a.file).read_text(encoding="utf-8"), a.bo)
+    if a.teams:
+        if len(a.teams) == 2:
+            pairs.append((a.teams[0], a.teams[1], a.bo))
+        else:
+            pairs += parse_match_lines(" ".join(a.teams), a.bo)
+    if not pairs:
+        sys.exit('Укажи матч: match "NAVI" "G2" --bo 3  или  match --file matches.txt')
+    predictor = _load_predictor(s, a.update)
+    matcher = TeamMatcher(sorted(predictor.engine.rating), s.aliases_json)
+    now = datetime.now(timezone.utc)
+    items, problems = [], []
+    for t1, t2, bo in pairs:
+        (c1, sc1), (c2, sc2) = matcher.match(t1), matcher.match(t2)
+        if not c1 or not c2:
+            miss = ", ".join(t for t, c in ((t1, c1), (t2, c2)) if not c)
+            problems.append(f"{t1} – {t2}: нет в базе — {miss}")
+            continue
+        pr = predictor.predict(c1, c2, bo, now)
+        st = build_strategy(pr, None, "", c1, c2, margin=a.margin)
+        if min(pr.games1, pr.games2) < s.min_team_games:
+            st.note = (st.note + "; " if st.note else "") + f"очень мало матчей ({pr.games1}/{pr.games2}) — прогноз ненадёжен"
+        if (c1, c2) != (t1, t2):
+            st.event = f"распознано как: {c1} / {c2}"
+        items.append(st)
+    items.sort(key=lambda st: -st.fav_p)
+    if items:
+        print(summary_table(items).replace("Время", "     ") + "\n")
+        for i, st in enumerate(items, 1):
+            print(match_card(st, i, all_markets=a.all) + "\n")
+    for p in problems:
+        print("⚠", p)
+
+
 # ---------------- режим с линией BetBoom (запускать на своём компьютере) ----------------
 
 def cmd_betboom(a, s: Settings) -> None:
@@ -321,6 +381,15 @@ def main(argv: list[str] | None = None) -> None:
         else:
             x.add_argument("--interval", type=int, default=1800, help="секунд между обновлениями")
         x.set_defaults(func=fn)
+
+    mt = sub.add_parser("match", help="прогноз для своих матчей: match \"NAVI\" \"G2\" --bo 3 или --file")
+    mt.add_argument("teams", nargs="*", help="две команды, или строка «NAVI vs G2 bo3»")
+    mt.add_argument("--bo", type=int, default=3, choices=[1, 3, 5])
+    mt.add_argument("--file", help="файл: по матчу в строке, «Команда1 vs Команда2 bo3»")
+    mt.add_argument("--margin", type=float, default=0.07)
+    mt.add_argument("--all", action="store_true", help="показать все рынки")
+    mt.add_argument("--update", action="store_true", help="сначала докачать свежие результаты")
+    mt.set_defaults(func=cmd_match)
 
     bb = sub.add_parser("betboom", help="сверка с линией BetBoom (только на своём компьютере)")
     bb.add_argument("--mode", choices=["auto", "playwright", "url", "csv"], default="auto")
