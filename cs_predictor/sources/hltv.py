@@ -107,7 +107,7 @@ def parse_match_maps(html: str, team1: str) -> list[MapResult]:
 def parse_upcoming_page(html: str) -> list[dict]:
     """Ближайшие матчи /matches. Поддерживает старую (upcomingMatch) и новую (match-wrapper) вёрстку."""
     soup = BeautifulSoup(html, "html.parser")
-    out = []
+    out: dict[tuple, dict] = {}
     for el in soup.select("div.upcomingMatch, div.match-wrapper"):
         names = [_text(x) for x in el.select(".matchTeamName, .match-teamname, .team-name")]
         names = [n for n in names if n and n.upper() != "TBD"]
@@ -116,10 +116,14 @@ def parse_upcoming_page(html: str) -> list[dict]:
         meta = _text(el.select_one(".matchMeta, .match-meta"))
         bo = _BO_RE.search(meta)
         if len(names) >= 2 and ts:
-            out.append({"team1": names[0], "team2": names[1], "start": parse_dt(ts),
-                        "best_of": int(bo.group(1)) if bo else None,
-                        "event": _text(el.select_one(".matchEventName, .match-event")), "source": "hltv"})
-    return out
+            item = {"team1": names[0], "team2": names[1], "start": parse_dt(ts),
+                    "best_of": int(bo.group(1)) if bo else None,
+                    "event": _text(el.select_one(".matchEventName, .match-event")), "source": "hltv"}
+            key = (item["team1"], item["team2"], item["start"])
+            # в новой вёрстке блоки вложены друг в друга — оставляем самый полный
+            if key not in out or (item["event"] and not out[key]["event"]):
+                out[key] = item
+    return list(out.values())
 
 
 class HLTVClient:

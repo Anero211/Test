@@ -5,6 +5,7 @@
   tune          — подобрать параметры Elo на истории (сохраняются в data/params.json)
   predict       — линия BetBoom на 1–2 дня → прогнозы, EV, сигналы (+ Telegram)
   watch         — predict в цикле раз в N секунд
+  upcoming      — прогнозы на ближайшие матчи по расписанию HLTV (без коэффициентов)
   betboom-dump  — сохранить все JSON-ответы сайта BetBoom (для настройки парсера)
   demo          — всё то же на синтетических данных (проверка установки без интернета)
 """
@@ -79,6 +80,8 @@ def cmd_tune(a, s: Settings) -> None:
     matches = load_matches(s.matches_csv)
     if not matches:
         sys.exit("История пуста — сначала `python -m cs_predictor collect`")
+    if a.until:  # подбираем только на прошлом, чтобы бэктест после этой даты был честным
+        matches = [m for m in matches if m.date < _date(a.until)]
     best, results = bt.tune(matches, s)
     print(f"{'K':>4} {'K_map':>6} {'shrink':>7} {'N':>6} {'acc':>7} {'logloss':>8}")
     for r in results:
@@ -161,6 +164,35 @@ def cmd_watch(a, s: Settings) -> None:
         time.sleep(a.interval + random.uniform(0, 15))
 
 
+def cmd_upcoming(a, s: Settings) -> None:
+    """Прогнозы на ближайшие матчи по расписанию HLTV/PandaScore — без коэффициентов БК."""
+    matches = load_matches(s.matches_csv)
+    if not matches:
+        sys.exit("История пуста — сначала `python -m cs_predictor collect`")
+    predictor = Predictor(bt.load_params(PARAMS)).train(matches)
+    matcher = TeamMatcher(sorted(predictor.engine.rating), s.aliases_json)
+    now = datetime.now(timezone.utc)
+    rows = []
+    for u in _schedule(s, a.hours):
+        start, bo = u.get("start"), u.get("best_of") or 3
+        if not start or not (now - timedelta(hours=1) <= start <= now + timedelta(hours=a.hours)):
+            continue
+        t1, t2 = matcher.match(u["team1"])[0], matcher.match(u["team2"])[0]
+        if not (t1 and t2) or t1 == t2:
+            continue
+        pr = predictor.predict(t1, t2, bo, start)
+        if min(pr.games1, pr.games2) < s.min_team_games or (a.bo3 and bo != 3):
+            continue
+        fav, p = (u["team1"], pr.p) if pr.p >= 0.5 else (u["team2"], 1 - pr.p)
+        rows.append((p, start, u, bo, fav))
+    rows.sort(key=lambda r: -r[0])
+    print(f"=== Прогнозы на {a.hours:.0f} ч по расписанию HLTV (без коэффициентов), по убыванию уверенности ===")
+    print(f"{'Начало (UTC)':<16} {'Матч':<42} {'Bo':<3} {'Фаворит модели':<22} {'P':>6}  {'Мин. кэф для EV≥' + format(s.min_ev, '.0%'):>18}  Турнир")
+    for p, start, u, bo, fav in rows[:a.top]:
+        print(f"{start:%Y-%m-%d %H:%M} {(u['team1'] + ' vs ' + u['team2'])[:42]:<42} {bo:<3} {fav[:22]:<22} "
+              f"{p:>6.1%}  {(1 + s.min_ev) / p:>18.2f}  {u.get('event', '')[:40]}")
+
+
 def cmd_betboom_dump(a, s: Settings) -> None:
     d = DATA_DIR / "betboom_dump"
     payloads = betboom.capture_with_playwright(s.betboom_page_url, wait_seconds=a.wait, dump_dir=d)
@@ -208,6 +240,7 @@ def main(argv: list[str] | None = None) -> None:
     b.set_defaults(func=cmd_backtest)
 
     t = sub.add_parser("tune", help="подбор параметров Elo")
+    t.add_argument("--until", help="использовать для подбора только матчи до этой даты")
     t.set_defaults(func=cmd_tune)
 
     for name, fn in (("predict", cmd_predict), ("watch", cmd_watch)):
@@ -221,6 +254,12 @@ def main(argv: list[str] | None = None) -> None:
         else:
             x.add_argument("--interval", type=int, default=120, help="секунд между опросами линии")
         x.set_defaults(func=fn)
+
+    u = sub.add_parser("upcoming", help="прогнозы по расписанию HLTV без коэффициентов")
+    u.add_argument("--hours", type=float, default=48)
+    u.add_argument("--top", type=int, default=25)
+    u.add_argument("--bo3", action="store_true", help="только Bo3")
+    u.set_defaults(func=cmd_upcoming)
 
     d = sub.add_parser("betboom-dump")
     d.add_argument("--wait", type=float, default=20)

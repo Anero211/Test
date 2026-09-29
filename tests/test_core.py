@@ -153,7 +153,7 @@ def test_hltv_match_maps_parser():
 
 
 def test_hltv_upcoming_parser():
-    up = parse_upcoming_page((FIX / "hltv_upcoming.html").read_text())
+    up = parse_upcoming_page((FIX / "hltv_upcoming.html").read_text())  # FURIA-PaiN продублирован — должен остаться один
     assert [(u["team1"], u["team2"], u["best_of"]) for u in up] == [("Natus Vincere", "G2", 3), ("FURIA", "PaiN", 3)]
 
 
