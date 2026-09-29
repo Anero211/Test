@@ -322,3 +322,28 @@ def test_parse_match_lines():
     from cs_predictor.__main__ import parse_match_lines
     text = "Vitality vs Spirit bo3\nNAVI - G2\nMOUZ — FaZe Bo5\n# комментарий\nбез разделителя\n"
     assert parse_match_lines(text) == [("Vitality", "Spirit", 3), ("NAVI", "G2", 3), ("MOUZ", "FaZe", 5)]
+
+
+def test_journal_settle_and_roi(tmp_path):
+    from cs_predictor import journal
+    start = T0 + timedelta(days=1)
+    mk = lambda i, pick, odds: journal.Bet(f"b{i}", T0.isoformat(), start.isoformat(), "A", "B", 3, pick,
+                                           "П1" if pick == "A" else "П2", odds, 0.6, 0.1, 1.0)
+    bets = [mk(1, "A", 1.8)]
+    assert journal.add_if_new(bets, mk(2, "A", 1.9)) is False  # тот же матч и сторона — не дублируем
+    assert journal.add_if_new(bets, mk(3, "B", 2.5)) is True
+    history = [Match("h1", start + timedelta(hours=2), "B", "A", 1, 2, 3)]  # A выиграла 2:1 (порядок команд другой)
+    done = journal.settle(bets, history, now=start + timedelta(hours=5))
+    assert len(done) == 2
+    a, b = bets
+    assert (a.status, a.score, a.profit) == ("won", "2:1", pytest.approx(0.8))
+    assert (b.status, b.profit) == ("lost", -1.0)
+    st = journal.stats(bets)
+    assert st["settled"] == 2 and st["roi"] == pytest.approx((0.8 - 1) / 2)
+    p = tmp_path / "bets.csv"
+    journal.save(p, bets)
+    assert [x.status for x in journal.load(p)] == ["won", "lost"]
+    # матч не состоялся за 4 дня — ставка аннулируется
+    old = [mk(9, "A", 1.7)]
+    journal.settle(old, [], now=start + timedelta(days=5))
+    assert old[0].status == "void"

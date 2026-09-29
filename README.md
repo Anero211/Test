@@ -83,6 +83,55 @@ python -m cs_predictor watch
 (`P(3 карты) = σ(a + b·logit(2q(1−q)))`) и распределяет счёт так, чтобы он сходился с
 вероятностью победы.
 
+## Автобот: сигналы в Telegram без ручного поиска
+
+`python -m cs_predictor bot` работает сам. Каждые 3 минуты он забирает линию CS2 с BetBoom,
+сравнивает каждый матч с моделью и присылает в Telegram только ставки с перевесом:
+
+```
+✅ СТАВИТЬ: П2 Marsborne @ 1.70
+LAG vs Marsborne · Bo3 · 30.09 04:00 МСК
+Модель: 68% · BetBoom считает: 56%
+Перевес (EV): +14.9% · ставка: 1% банка
+```
+
+Сигнал приходит, только если выполнены все условия:
+- Bo3;
+- коэффициент в диапазоне 1.55–1.85;
+- EV от 7% до 30%;
+- у обеих команд не меньше 15 матчей в истории.
+
+Пороги задаются в `.env` (`MIN_ODDS`, `MAX_ODDS`, `MIN_EV`, `MAX_EV`). Все остальные матчи бот
+пропускает молча: если букмекер согласен с моделью, ставка в среднем приносит минус на размер маржи.
+
+**Журнал ставок** — `data/bets.csv`. Каждый сигнал записывается с коэффициентом на момент
+отправки. Раз в час бот докачивает результаты с HLTV, рассчитывает ставки и присылает итоги.
+Каждый день в 10:00 МСК приходит сводка: угадано, прибыль в % банка, ROI. Посмотреть журнал
+вручную: `python -m cs_predictor journal`. Выводы о стратегии имеет смысл делать после 50–100
+рассчитанных ставок.
+
+Флаги для проверки:
+- `bot --once --dry-run` — один проход, сообщения печатаются в консоль, а не в Telegram;
+- `--mode csv` — брать линию из `data/betboom_manual.csv` вместо сайта.
+
+### Установка на сервер (работает круглосуточно)
+
+Нужен VPS с российским IP: BetBoom может не показывать линию зарубежным адресам. Подойдёт
+Ubuntu 22.04/24.04, 2 ядра, 2 ГБ памяти, диск 20 ГБ (Timeweb Cloud, Selectel, Beget и т. п.).
+
+```bash
+ssh root@<IP сервера>
+git clone https://github.com/Anero211/Test && cd Test && git checkout ccr-e5e07bdb-kkvb9h
+sudo bash deploy/setup.sh                         # Python, Chromium, служба systemd
+nano .env                                         # TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID
+.venv/bin/python -m cs_predictor betboom-dump     # проверить, что линия BetBoom читается
+.venv/bin/python -m cs_predictor bot --once --dry-run
+sudo systemctl enable --now cs-predictor-bot      # запустить навсегда
+journalctl -u cs-predictor-bot -f                 # логи
+```
+
+Токен бота выдаёт @BotFather. Chat id — это твой id: его покажет @userinfobot.
+
 ### Режим с линией BetBoom (необязательно, только на своём компьютере)
 
 `python -m cs_predictor betboom` сравнивает прогнозы с живой линией BetBoom, считает EV и
@@ -233,7 +282,10 @@ cs_predictor/
   odds.py            маржа, вероятности без маржи, EV, Келли
   signals.py         сведение линии BetBoom с прогнозами, фильтр, таблицы, лог коэффициентов
   backtest.py        walk-forward бэктест, метрики, симуляция ставок, подбор параметров
+  bot.py             автобот: линия BetBoom → сигналы → журнал → сводки
+  journal.py         журнал ставок, расчёт по результатам HLTV, ROI
   notify.py          Telegram
+deploy/              setup.sh и служба systemd для сервера
   synthetic.py       синтетические данные для demo и тестов
   sources/hltv.py, pandascore.py, betboom.py, http.py
 tests/               pytest (парсеры, математика, отсутствие заглядывания в будущее, фильтр сигналов)

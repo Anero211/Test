@@ -5,6 +5,8 @@
   tune          — подобрать параметры Elo на истории (сохраняются в data/params.json)
   predict       — предстоящие матчи HLTV: вероятности, счёт по картам, с какого кэфа ставить
   watch         — predict в цикле + новые матчи в Telegram
+  bot           — автобот: линия BetBoom → «СТАВИТЬ» в Telegram → журнал ставок и ROI
+  journal       — журнал ставок бота: результаты и реальный ROI
   match         — прогноз для своих матчей: match "NAVI" "G2" --bo 3  или  match --file list.txt
   betboom       — сверка прогнозов с линией BetBoom (EV, сигналы) — только на своём компьютере
   betboom-dump  — сохранить все JSON-ответы сайта BetBoom (для настройки парсера)
@@ -285,6 +287,31 @@ def cmd_match(a, s: Settings) -> None:
         print("⚠", p)
 
 
+# ---------------- автоматический бот и журнал ставок ----------------
+
+def cmd_bot(a, s: Settings) -> None:
+    from .bot import Bot
+    if a.hours:
+        s.horizon_hours = a.hours
+    Bot(s, a.mode, a.interval, a.stake, a.dry_run, a.summary_hour, not a.no_update).run(once=a.once)
+
+
+def cmd_journal(a, s: Settings) -> None:
+    from . import journal
+    from .bot import BETS
+    bets = journal.load(BETS)
+    done = journal.settle(bets, load_matches(s.matches_csv))
+    if done:
+        journal.save(BETS, bets)
+    print(journal.report(bets))
+    opened = [b for b in bets if b.status == "open"]
+    if opened:
+        print("\nОткрытые:")
+        for b in opened:
+            print(f"  {b.start[:16].replace('T', ' ')} UTC  {b.team1} – {b.team2}: {b.market} {b.pick} @ {b.odds:.2f}"
+                  f" (модель {b.p_model:.0%}, EV {b.ev:+.1%})")
+
+
 # ---------------- режим с линией BetBoom (запускать на своём компьютере) ----------------
 
 def cmd_betboom(a, s: Settings) -> None:
@@ -381,6 +408,20 @@ def main(argv: list[str] | None = None) -> None:
         else:
             x.add_argument("--interval", type=int, default=1800, help="секунд между обновлениями")
         x.set_defaults(func=fn)
+
+    bt_ = sub.add_parser("bot", help="автобот: линия BetBoom → сигналы в Telegram → журнал и ROI")
+    bt_.add_argument("--mode", choices=["auto", "playwright", "url", "csv"], default="playwright")
+    bt_.add_argument("--interval", type=int, default=180, help="секунд между проверками линии")
+    bt_.add_argument("--stake", type=float, default=1.0, help="ставка в %% банка (плоская)")
+    bt_.add_argument("--hours", type=float, help="горизонт, часов (по умолчанию 48)")
+    bt_.add_argument("--summary-hour", type=int, default=10, help="час (МСК) ежедневной сводки")
+    bt_.add_argument("--once", action="store_true", help="один проход и выход (проверка)")
+    bt_.add_argument("--dry-run", action="store_true", help="не слать в Telegram, печатать в консоль")
+    bt_.add_argument("--no-update", action="store_true", help="не докачивать результаты HLTV")
+    bt_.set_defaults(func=cmd_bot)
+
+    jr = sub.add_parser("journal", help="журнал ставок бота: результаты и ROI")
+    jr.set_defaults(func=cmd_journal)
 
     mt = sub.add_parser("match", help="прогноз для своих матчей: match \"NAVI\" \"G2\" --bo 3 или --file")
     mt.add_argument("teams", nargs="*", help="две команды, или строка «NAVI vs G2 bo3»")
